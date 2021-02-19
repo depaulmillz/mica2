@@ -58,6 +58,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <functional>
 
 #ifndef ETCD_SERVER
 // Enable by default or use build flags
