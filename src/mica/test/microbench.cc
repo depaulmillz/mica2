@@ -196,18 +196,19 @@ void benchmark_proc(Task* task) {
   gettimeofday(&task->tv_end, nullptr);
 }
 
-void benchmark(double zipf_theta) {
+void benchmark(double zipf_theta, int readratio) {
   ::mica::util::lcore.pin_thread(0);
 
   printf("zipf_theta = %lf\n", zipf_theta);
 
-  size_t num_items = 16 * 1048576;
+  size_t num_items = 1000000;//10000000;  //16 * 1048576;
+  size_t range = 1000000;
 
   auto config = ::mica::util::Config::load_file("microbench.json");
 
   uint16_t num_threads =
       static_cast<uint16_t>(config.get("processor").get("lcores").size());
-  size_t num_operations = 16 * 1048576;
+  size_t num_operations = 512;  //16 * 1048576;
   size_t max_num_operations_per_thread = num_operations;
 
   size_t key_length = ::mica::util::roundup<8>(sizeof(uint64_t));
@@ -318,264 +319,143 @@ void benchmark(double zipf_theta) {
       // clang-format on
   };
 
-  for (auto& benchmark_mode : benchmark_modes) {
-    switch (benchmark_mode) {
-      case BenchmarkMode::kAdd:
-        printf("adding %zu items\n", num_items);
-        break;
-      case BenchmarkMode::kSet:
-        printf("setting %zu items\n", num_items);
-        break;
-      case BenchmarkMode::kGetHit:
-        printf("getting %zu items (hit)\n", num_items);
-        break;
-      case BenchmarkMode::kGetMiss:
-        printf("getting %zu items (miss)\n", num_items);
-        break;
-      case BenchmarkMode::kGetSet95:
-        printf("getting/setting %zu items (95%% get)\n", num_items);
-        break;
-      case BenchmarkMode::kGetSet50:
-        printf("getting/setting %zu items (50%% get)\n", num_items);
-        break;
-      case BenchmarkMode::kDelete:
-        printf("deleting %zu items\n", num_items);
-        break;
-      case BenchmarkMode::kSet1:
-        printf("setting 1 item\n");
-        break;
-      case BenchmarkMode::kGet1:
-        printf("getting 1 item\n");
-        break;
-      default:
-        assert(false);
+  printf("getting/setting %zu items (%d%% get)\n", num_items, readratio);
+
+  printf("generating workload\n");
+  ::mica::util::Rand thread_rand(1);
+  // ::mica::util::Rand key_rand(2);
+  ::mica::util::Rand op_type_rand(3);
+
+  uint32_t get_threshold = 0;
+  get_threshold = (uint32_t)((readratio / 100.0) * (double)((uint32_t)-1));
+
+  ::mica::util::ZipfGen zg(range, zipf_theta, time(nullptr));  // TODO edit
+
+  for (size_t thread_id = 0; thread_id < num_threads; thread_id++)
+    op_count[thread_id] = 0;
+
+  for (size_t j = 0; j < num_operations; j++) {
+    size_t i;
+    i = zg.next();
+
+    uint16_t partition_id = key_parts[i];
+
+    uint32_t op_r = op_type_rand.next_u32();
+    bool is_get = op_r <= get_threshold;
+
+    uint16_t thread_id;
+    if (is_get) {
+      if (concurrent_read == false)
+        thread_id = processor.get_owner_lcore_id(partition_id);
+      else
+        thread_id = static_cast<uint16_t>(thread_rand.next_u32() % num_threads);
+    } else {
+      if (concurrent_write == false)
+        thread_id = processor.get_owner_lcore_id(partition_id);
+      else
+        thread_id = static_cast<uint16_t>(thread_rand.next_u32() % num_threads);
     }
 
-    printf("generating workload\n");
-    ::mica::util::Rand thread_rand(1);
-    // ::mica::util::Rand key_rand(2);
-    ::mica::util::Rand op_type_rand(3);
+    if (op_count[thread_id] < max_num_operations_per_thread) {
+      uint8_t op_type;
+      op_type =
+          static_cast<uint8_t>(is_get ? Operation::kGet : Operation::kSet);
+      op_types[thread_id][op_count[thread_id]] = op_type;
+      ::mica::util::memcpy(
+          op_keys[thread_id] + key_length * op_count[thread_id],
+          keys + key_length * i, key_length);
+      op_key_hashes[thread_id][op_count[thread_id]] = key_hashes[i];
+      ::mica::util::memcpy(
+          op_values[thread_id] + value_length * op_count[thread_id],
+          values + value_length * i, value_length);
+      op_count[thread_id]++;
+    } else
+      break;
+  }
 
-    uint32_t get_threshold = 0;
-    if (benchmark_mode == BenchmarkMode::kAdd ||
-        benchmark_mode == BenchmarkMode::kSet ||
-        benchmark_mode == BenchmarkMode::kDelete ||
-        benchmark_mode == BenchmarkMode::kSet1)
-      get_threshold = (uint32_t)(0.0 * (double)((uint32_t)-1));
-    else if (benchmark_mode == BenchmarkMode::kGetHit ||
-             benchmark_mode == BenchmarkMode::kGetMiss ||
-             benchmark_mode == BenchmarkMode::kGet1)
-      get_threshold = (uint32_t)(1.0 * (double)((uint32_t)-1));
-    else if (benchmark_mode == BenchmarkMode::kGetSet95)
-      get_threshold = (uint32_t)(0.95 * (double)((uint32_t)-1));
-    else if (benchmark_mode == BenchmarkMode::kGetSet50)
-      get_threshold = (uint32_t)(0.5 * (double)((uint32_t)-1));
-    else
-      assert(false);
+  printf("executing workload\n");
 
-    ::mica::util::ZipfGen zg(num_items, zipf_theta,
-                             static_cast<uint64_t>(benchmark_mode));
+  for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
+    Task& task = tasks[thread_id];
 
-    for (size_t thread_id = 0; thread_id < num_threads; thread_id++)
-      op_count[thread_id] = 0;
+    task.count = op_count[thread_id];
+    task.total_operation_count = 0;
+    task.success_count = 0;
+  }
 
-    for (size_t j = 0; j < num_operations; j++) {
-      size_t i;
-      if (benchmark_mode == BenchmarkMode::kAdd ||
-          benchmark_mode == BenchmarkMode::kDelete) {
-        if (j >= num_items) break;
-        i = j;
-      } else if (benchmark_mode == BenchmarkMode::kGet1 ||
-                 benchmark_mode == BenchmarkMode::kSet1)
-        i = 0;
-      else {
-        // i = key_rand.next_u32() % num_items;
-        i = zg.next();
-        if (benchmark_mode == BenchmarkMode::kGetMiss) i += num_items;
-      }
+  processor.reset_load_stats();
 
-      uint16_t partition_id = key_parts[i];
+  running_threads = 0;
+  ::mica::util::memory_barrier();
 
-      uint32_t op_r = op_type_rand.next_u32();
-      bool is_get = op_r <= get_threshold;
+  std::vector<std::thread> threads;
+  for (size_t thread_id = 1; thread_id < num_threads; thread_id++)
+    threads.emplace_back(benchmark_proc, &tasks[thread_id]);
 
-      uint16_t thread_id;
-      if (is_get) {
-        if (concurrent_read == false)
-          thread_id = processor.get_owner_lcore_id(partition_id);
-        else
-          thread_id =
-              static_cast<uint16_t>(thread_rand.next_u32() % num_threads);
-      } else {
-        if (concurrent_write == false)
-          thread_id = processor.get_owner_lcore_id(partition_id);
-        else
-          thread_id =
-              static_cast<uint16_t>(thread_rand.next_u32() % num_threads);
-      }
+  benchmark_proc(&tasks[0]);
 
-      if (op_count[thread_id] < max_num_operations_per_thread) {
-        uint8_t op_type;
-        switch (benchmark_mode) {
-          case BenchmarkMode::kAdd:
-            op_type = static_cast<uint8_t>(Operation::kAdd);
-            break;
-          case BenchmarkMode::kSet:
-          case BenchmarkMode::kSet1:
-            op_type = static_cast<uint8_t>(Operation::kSet);
-            break;
-          case BenchmarkMode::kGetHit:
-          case BenchmarkMode::kGet1:
-          case BenchmarkMode::kGetMiss:
-            op_type = static_cast<uint8_t>(Operation::kGet);
-            break;
-          case BenchmarkMode::kGetSet95:
-          case BenchmarkMode::kGetSet50:
-            op_type = static_cast<uint8_t>(is_get ? Operation::kGet
-                                                  : Operation::kSet);
-            break;
-          case BenchmarkMode::kDelete:
-            op_type = static_cast<uint8_t>(Operation::kDelete);
-            break;
-          default:
-            assert(false);
-            op_type = static_cast<uint8_t>(Operation::kNoopRead);
-            break;
-        }
-        op_types[thread_id][op_count[thread_id]] = op_type;
-        ::mica::util::memcpy(
-            op_keys[thread_id] + key_length * op_count[thread_id],
-            keys + key_length * i, key_length);
-        op_key_hashes[thread_id][op_count[thread_id]] = key_hashes[i];
-        ::mica::util::memcpy(
-            op_values[thread_id] + value_length * op_count[thread_id],
-            values + value_length * i, value_length);
-        op_count[thread_id]++;
-      } else
-        break;
-    }
+  while (threads.size() > 0) {
+    threads.back().join();
+    threads.pop_back();
+  }
 
-    printf("executing workload\n");
-
+  double diff;
+  {
+    double min_start = 0.;
+    double max_end = 0.;
     for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
-      Task& task = tasks[thread_id];
-
-      task.count = op_count[thread_id];
-      task.total_operation_count = 0;
-      task.success_count = 0;
+      double start = (double)tasks[thread_id].tv_start.tv_sec * 1. +
+                     (double)tasks[thread_id].tv_start.tv_usec * 0.000001;
+      double end = (double)tasks[thread_id].tv_end.tv_sec * 1. +
+                   (double)tasks[thread_id].tv_end.tv_usec * 0.000001;
+      if (thread_id == 0 || min_start > start) min_start = start;
+      if (thread_id == 0 || max_end < end) max_end = end;
     }
 
-    processor.reset_load_stats();
+    diff = max_end - min_start;
+  }
 
-    running_threads = 0;
-    ::mica::util::memory_barrier();
+  size_t success_count = 0;
+  size_t total_operation_count = 0;
+  uint64_t max_operation_count = 0;
+  for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
+    total_operation_count += tasks[thread_id].total_operation_count;
+    success_count += tasks[thread_id].success_count;
+    if (max_operation_count < tasks[thread_id].total_operation_count)
+      max_operation_count = tasks[thread_id].total_operation_count;
+  }
 
-    std::vector<std::thread> threads;
-    for (size_t thread_id = 1; thread_id < num_threads; thread_id++)
-      threads.emplace_back(benchmark_proc, &tasks[thread_id]);
+  printf("operations: %zu\n", total_operation_count);
+  printf("success_count: %zu\n", success_count);
 
-    benchmark_proc(&tasks[0]);
-
-    while (threads.size() > 0) {
-      threads.back().join();
-      threads.pop_back();
+  for (uint16_t thread_id = 0; thread_id < num_threads; thread_id++) {
+    uint32_t request_count_sum = 0;
+    uint64_t processing_time = processor.get_processing_time(thread_id);
+    for (uint16_t index = 0; index < processor.get_table_count(); index++) {
+      uint32_t request_count = processor.get_request_count(thread_id, index);
+      request_count_sum += request_count;
     }
+    if (request_count_sum == 0) request_count_sum = 1;
 
-    double diff;
-    {
-      double min_start = 0.;
-      double max_end = 0.;
-      for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
-        double start = (double)tasks[thread_id].tv_start.tv_sec * 1. +
-                       (double)tasks[thread_id].tv_start.tv_usec * 0.000001;
-        double end = (double)tasks[thread_id].tv_end.tv_sec * 1. +
-                     (double)tasks[thread_id].tv_end.tv_usec * 0.000001;
-        if (thread_id == 0 || min_start > start) min_start = start;
-        if (thread_id == 0 || max_end < end) max_end = end;
-      }
-
-      diff = max_end - min_start;
+    printf("lcore %2hu:", thread_id);
+    printf(" %4.0lf clocks/req ", static_cast<double>(processing_time) /
+                                      static_cast<double>(request_count_sum));
+    for (uint16_t index = 0; index < processor.get_table_count(); index++) {
+      uint32_t request_count = processor.get_request_count(thread_id, index);
+      printf(" %3.0lf", 100. * static_cast<double>(request_count) /
+                            static_cast<double>(max_operation_count));
     }
-
-    size_t success_count = 0;
-    size_t total_operation_count = 0;
-    uint64_t max_operation_count = 0;
-    for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
-      total_operation_count += tasks[thread_id].total_operation_count;
-      success_count += tasks[thread_id].success_count;
-      if (max_operation_count < tasks[thread_id].total_operation_count)
-        max_operation_count = tasks[thread_id].total_operation_count;
-    }
-
-    printf("operations: %zu\n", total_operation_count);
-    printf("success_count: %zu\n", success_count);
-
-    for (uint16_t thread_id = 0; thread_id < num_threads; thread_id++) {
-      uint32_t request_count_sum = 0;
-      uint64_t processing_time = processor.get_processing_time(thread_id);
-      for (uint16_t index = 0; index < processor.get_table_count(); index++) {
-        uint32_t request_count = processor.get_request_count(thread_id, index);
-        request_count_sum += request_count;
-      }
-      if (request_count_sum == 0) request_count_sum = 1;
-
-      printf("lcore %2hu:", thread_id);
-      printf(" %4.0lf clocks/req ", static_cast<double>(processing_time) /
-                                        static_cast<double>(request_count_sum));
-      for (uint16_t index = 0; index < processor.get_table_count(); index++) {
-        uint32_t request_count = processor.get_request_count(thread_id, index);
-        printf(" %3.0lf", 100. * static_cast<double>(request_count) /
-                              static_cast<double>(max_operation_count));
-      }
-      printf("\n");
-    }
-
-    switch (benchmark_mode) {
-      case BenchmarkMode::kAdd:
-        add_ops = (double)total_operation_count / diff;
-        mem_diff = alloc.get_memuse() - mem_start;
-        break;
-      case BenchmarkMode::kSet:
-        set_ops = (double)total_operation_count / diff;
-        break;
-      case BenchmarkMode::kGetHit:
-        get_hit_ops = (double)total_operation_count / diff;
-        break;
-      case BenchmarkMode::kGetMiss:
-        get_miss_ops = (double)total_operation_count / diff;
-        break;
-      case BenchmarkMode::kGetSet95:
-        get_set_95_ops = (double)total_operation_count / diff;
-        break;
-      case BenchmarkMode::kGetSet50:
-        get_set_50_ops = (double)total_operation_count / diff;
-        break;
-      case BenchmarkMode::kDelete:
-        delete_ops = (double)total_operation_count / diff;
-        break;
-      case BenchmarkMode::kSet1:
-        set_1_ops = (double)total_operation_count / diff;
-        break;
-      case BenchmarkMode::kGet1:
-        get_1_ops = (double)total_operation_count / diff;
-        break;
-      default:
-        assert(false);
-    }
-
     printf("\n");
   }
 
-  printf("memory:     %10.2lf MB\n", (double)mem_diff * 0.000001);
-  printf("add:        %10.2lf Mops\n", add_ops * 0.000001);
-  printf("set:        %10.2lf Mops\n", set_ops * 0.000001);
-  printf("get_hit:    %10.2lf Mops\n", get_hit_ops * 0.000001);
-  printf("get_miss:   %10.2lf Mops\n", get_miss_ops * 0.000001);
-  printf("get_set_95: %10.2lf Mops\n", get_set_95_ops * 0.000001);
-  printf("get_set_50: %10.2lf Mops\n", get_set_50_ops * 0.000001);
-  printf("delete:     %10.2lf Mops\n", delete_ops * 0.000001);
-  printf("set_1:      %10.2lf Mops\n", set_1_ops * 0.000001);
-  printf("get_1:      %10.2lf Mops\n", get_1_ops * 0.000001);
+  auto get_set_ops = (double)total_operation_count / diff;
+
+  printf("\n");
+
+  //printf("memory:     %10.2lf MB\n", (double)mem_diff * 0.000001);
+  printf("throughput:        %10.2lf Mops\n", get_set_ops * 0.000001);
+  printf("average latency:        %10.2lf us\n", diff * 1e6);
+
 }
 
 int main(int argc, const char* argv[]) {
@@ -584,7 +464,7 @@ int main(int argc, const char* argv[]) {
     return EXIT_FAILURE;
   }
 
-  benchmark(atof(argv[1]));
+  benchmark(atof(argv[1]), 95);
 
   return EXIT_SUCCESS;
 }
