@@ -186,7 +186,7 @@ void benchmark_proc(Task* task) {
   //   (void)ret;
   // }
 
-  for (auto i = 0; i < 10; i++) {
+  for (auto i = 0; i < 1; i++) {
     task->processor->process(ra);
     task->total_operation_count += ra.count();
   }
@@ -319,143 +319,146 @@ void benchmark(double zipf_theta, int readratio) {
       // clang-format on
   };
 
-  printf("getting/setting %zu items (%d%% get)\n", num_items, readratio);
+  for(int testRepeat = 0; testRepeat < 10; testRepeat++) {
+    printf("getting/setting %zu items (%d%% get)\n", num_items, readratio);
 
-  printf("generating workload\n");
-  ::mica::util::Rand thread_rand(1);
-  // ::mica::util::Rand key_rand(2);
-  ::mica::util::Rand op_type_rand(3);
+    printf("generating workload\n");
+    ::mica::util::Rand thread_rand(1);
+    // ::mica::util::Rand key_rand(2);
+    ::mica::util::Rand op_type_rand(3);
 
-  uint32_t get_threshold = 0;
-  get_threshold = (uint32_t)((readratio / 100.0) * (double)((uint32_t)-1));
+    uint32_t get_threshold = 0;
+    get_threshold = (uint32_t)((readratio / 100.0) * (double)((uint32_t)-1));
 
-  ::mica::util::ZipfGen zg(range, zipf_theta, time(nullptr));  // TODO edit
+    ::mica::util::ZipfGen zg(range, zipf_theta, time(nullptr));  // TODO edit
 
-  for (size_t thread_id = 0; thread_id < num_threads; thread_id++)
-    op_count[thread_id] = 0;
+    for (size_t thread_id = 0; thread_id < num_threads; thread_id++)
+      op_count[thread_id] = 0;
 
-  for (size_t j = 0; j < num_operations; j++) {
-    size_t i;
-    i = zg.next();
+    for (size_t j = 0; j < num_operations; j++) {
+      size_t i;
+      i = zg.next();
 
-    uint16_t partition_id = key_parts[i];
+      uint16_t partition_id = key_parts[i];
 
-    uint32_t op_r = op_type_rand.next_u32();
-    bool is_get = op_r <= get_threshold;
+      uint32_t op_r = op_type_rand.next_u32();
+      bool is_get = op_r <= get_threshold;
 
-    uint16_t thread_id;
-    if (is_get) {
-      if (concurrent_read == false)
-        thread_id = processor.get_owner_lcore_id(partition_id);
-      else
-        thread_id = static_cast<uint16_t>(thread_rand.next_u32() % num_threads);
-    } else {
-      if (concurrent_write == false)
-        thread_id = processor.get_owner_lcore_id(partition_id);
-      else
-        thread_id = static_cast<uint16_t>(thread_rand.next_u32() % num_threads);
+      uint16_t thread_id;
+      if (is_get) {
+        if (concurrent_read == false)
+          thread_id = processor.get_owner_lcore_id(partition_id);
+        else
+          thread_id =
+              static_cast<uint16_t>(thread_rand.next_u32() % num_threads);
+      } else {
+        if (concurrent_write == false)
+          thread_id = processor.get_owner_lcore_id(partition_id);
+        else
+          thread_id =
+              static_cast<uint16_t>(thread_rand.next_u32() % num_threads);
+      }
+
+      if (op_count[thread_id] < max_num_operations_per_thread) {
+        uint8_t op_type;
+        op_type =
+            static_cast<uint8_t>(is_get ? Operation::kGet : Operation::kSet);
+        op_types[thread_id][op_count[thread_id]] = op_type;
+        ::mica::util::memcpy(
+            op_keys[thread_id] + key_length * op_count[thread_id],
+            keys + key_length * i, key_length);
+        op_key_hashes[thread_id][op_count[thread_id]] = key_hashes[i];
+        ::mica::util::memcpy(
+            op_values[thread_id] + value_length * op_count[thread_id],
+            values + value_length * i, value_length);
+        op_count[thread_id]++;
+      } else
+        break;
     }
 
-    if (op_count[thread_id] < max_num_operations_per_thread) {
-      uint8_t op_type;
-      op_type =
-          static_cast<uint8_t>(is_get ? Operation::kGet : Operation::kSet);
-      op_types[thread_id][op_count[thread_id]] = op_type;
-      ::mica::util::memcpy(
-          op_keys[thread_id] + key_length * op_count[thread_id],
-          keys + key_length * i, key_length);
-      op_key_hashes[thread_id][op_count[thread_id]] = key_hashes[i];
-      ::mica::util::memcpy(
-          op_values[thread_id] + value_length * op_count[thread_id],
-          values + value_length * i, value_length);
-      op_count[thread_id]++;
-    } else
-      break;
-  }
+    printf("executing workload\n");
 
-  printf("executing workload\n");
-
-  for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
-    Task& task = tasks[thread_id];
-
-    task.count = op_count[thread_id];
-    task.total_operation_count = 0;
-    task.success_count = 0;
-  }
-
-  processor.reset_load_stats();
-
-  running_threads = 0;
-  ::mica::util::memory_barrier();
-
-  std::vector<std::thread> threads;
-  for (size_t thread_id = 1; thread_id < num_threads; thread_id++)
-    threads.emplace_back(benchmark_proc, &tasks[thread_id]);
-
-  benchmark_proc(&tasks[0]);
-
-  while (threads.size() > 0) {
-    threads.back().join();
-    threads.pop_back();
-  }
-
-  double diff;
-  {
-    double min_start = 0.;
-    double max_end = 0.;
     for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
-      double start = (double)tasks[thread_id].tv_start.tv_sec * 1. +
-                     (double)tasks[thread_id].tv_start.tv_usec * 0.000001;
-      double end = (double)tasks[thread_id].tv_end.tv_sec * 1. +
-                   (double)tasks[thread_id].tv_end.tv_usec * 0.000001;
-      if (thread_id == 0 || min_start > start) min_start = start;
-      if (thread_id == 0 || max_end < end) max_end = end;
+      Task& task = tasks[thread_id];
+
+      task.count = op_count[thread_id];
+      task.total_operation_count = 0;
+      task.success_count = 0;
     }
 
-    diff = max_end - min_start;
-  }
+    processor.reset_load_stats();
 
-  size_t success_count = 0;
-  size_t total_operation_count = 0;
-  uint64_t max_operation_count = 0;
-  for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
-    total_operation_count += tasks[thread_id].total_operation_count;
-    success_count += tasks[thread_id].success_count;
-    if (max_operation_count < tasks[thread_id].total_operation_count)
-      max_operation_count = tasks[thread_id].total_operation_count;
-  }
+    running_threads = 0;
+    ::mica::util::memory_barrier();
 
-  printf("operations: %zu\n", total_operation_count);
-  printf("success_count: %zu\n", success_count);
+    std::vector<std::thread> threads;
+    for (size_t thread_id = 1; thread_id < num_threads; thread_id++)
+      threads.emplace_back(benchmark_proc, &tasks[thread_id]);
 
-  for (uint16_t thread_id = 0; thread_id < num_threads; thread_id++) {
-    uint32_t request_count_sum = 0;
-    uint64_t processing_time = processor.get_processing_time(thread_id);
-    for (uint16_t index = 0; index < processor.get_table_count(); index++) {
-      uint32_t request_count = processor.get_request_count(thread_id, index);
-      request_count_sum += request_count;
+    benchmark_proc(&tasks[0]);
+
+    while (threads.size() > 0) {
+      threads.back().join();
+      threads.pop_back();
     }
-    if (request_count_sum == 0) request_count_sum = 1;
 
-    printf("lcore %2hu:", thread_id);
-    printf(" %4.0lf clocks/req ", static_cast<double>(processing_time) /
-                                      static_cast<double>(request_count_sum));
-    for (uint16_t index = 0; index < processor.get_table_count(); index++) {
-      uint32_t request_count = processor.get_request_count(thread_id, index);
-      printf(" %3.0lf", 100. * static_cast<double>(request_count) /
-                            static_cast<double>(max_operation_count));
+    double diff;
+    {
+      double min_start = 0.;
+      double max_end = 0.;
+      for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
+        double start = (double)tasks[thread_id].tv_start.tv_sec * 1. +
+                       (double)tasks[thread_id].tv_start.tv_usec * 0.000001;
+        double end = (double)tasks[thread_id].tv_end.tv_sec * 1. +
+                     (double)tasks[thread_id].tv_end.tv_usec * 0.000001;
+        if (thread_id == 0 || min_start > start) min_start = start;
+        if (thread_id == 0 || max_end < end) max_end = end;
+      }
+
+      diff = max_end - min_start;
     }
+
+    size_t success_count = 0;
+    size_t total_operation_count = 0;
+    uint64_t max_operation_count = 0;
+    for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
+      total_operation_count += tasks[thread_id].total_operation_count;
+      success_count += tasks[thread_id].success_count;
+      if (max_operation_count < tasks[thread_id].total_operation_count)
+        max_operation_count = tasks[thread_id].total_operation_count;
+    }
+
+    printf("operations: %zu\n", total_operation_count);
+    printf("success_count: %zu\n", success_count);
+
+    for (uint16_t thread_id = 0; thread_id < num_threads; thread_id++) {
+      uint32_t request_count_sum = 0;
+      uint64_t processing_time = processor.get_processing_time(thread_id);
+      for (uint16_t index = 0; index < processor.get_table_count(); index++) {
+        uint32_t request_count = processor.get_request_count(thread_id, index);
+        request_count_sum += request_count;
+      }
+      if (request_count_sum == 0) request_count_sum = 1;
+
+      printf("lcore %2hu:", thread_id);
+      printf(" %4.0lf clocks/req ", static_cast<double>(processing_time) /
+                                        static_cast<double>(request_count_sum));
+      for (uint16_t index = 0; index < processor.get_table_count(); index++) {
+        uint32_t request_count = processor.get_request_count(thread_id, index);
+        printf(" %3.0lf", 100. * static_cast<double>(request_count) /
+                              static_cast<double>(max_operation_count));
+      }
+      printf("\n");
+    }
+
+    auto get_set_ops = (double)total_operation_count / diff;
+
     printf("\n");
+
+    //printf("memory:     %10.2lf MB\n", (double)mem_diff * 0.000001);
+    printf("throughput:        %10.2lf Mops\n", get_set_ops * 0.000001);
+    printf("average latency:        %10.2lf us\n", diff * 1e6);
   }
-
-  auto get_set_ops = (double)total_operation_count / diff;
-
-  printf("\n");
-
-  //printf("memory:     %10.2lf MB\n", (double)mem_diff * 0.000001);
-  printf("throughput:        %10.2lf Mops\n", get_set_ops * 0.000001);
-  printf("average latency:        %10.2lf us\n", diff * 1e6);
-
 }
 
 int main(int argc, const char* argv[]) {
