@@ -199,9 +199,9 @@ void benchmark_proc(Task* task) {
 void benchmark(double zipf_theta, int readratio) {
   ::mica::util::lcore.pin_thread(0);
 
-  printf("zipf_theta = %lf\n", zipf_theta);
+  fprintf(stderr, "zipf_theta = %lf\n", zipf_theta);
 
-  size_t num_items = 1000000;//10000000;  //16 * 1048576;
+  size_t num_items = 1000000;  //10000000;  //16 * 1048576;
   size_t range = 1000000;
 
   auto config = ::mica::util::Config::load_file("microbench.json");
@@ -273,7 +273,7 @@ void benchmark(double zipf_theta, int readratio) {
   double set_1_ops = -1.;
   double get_1_ops = -1.;
 
-  printf("generating %zu items (including %zu miss items)\n", num_items,
+  fprintf(stderr,"generating %zu items (including %zu miss items)\n", num_items,
          num_items);
   for (size_t i = 0; i < num_items * 2; i++) {
     *(uint64_t*)(keys + i * key_length) = i;
@@ -281,7 +281,7 @@ void benchmark(double zipf_theta, int readratio) {
     *(key_parts + i) = processor.get_partition_id(*(key_hashes + i));
     *(uint64_t*)(values + i * value_length) = i;
   }
-  printf("\n");
+  fprintf(stderr, "\n");
 
   Task tasks[num_threads];
 
@@ -305,24 +305,81 @@ void benchmark(double zipf_theta, int readratio) {
     // task.success_count
   }
 
-  BenchmarkMode benchmark_modes[] = {
-      // clang-format off
-      BenchmarkMode::kAdd,
-      BenchmarkMode::kSet,
-      BenchmarkMode::kGetHit,
-      BenchmarkMode::kGetMiss,
-      BenchmarkMode::kGetSet95,
-      BenchmarkMode::kGetSet50,
-      BenchmarkMode::kDelete,
-      BenchmarkMode::kSet1,
-      BenchmarkMode::kGet1,
-      // clang-format on
-  };
+  // populate the table
+  {
+    ::mica::util::Rand thread_rand(1);
+    // ::mica::util::Rand key_rand(2);
+    ::mica::util::Rand op_type_rand(3);
 
-  for(int testRepeat = 0; testRepeat < 10; testRepeat++) {
-    printf("getting/setting %zu items (%d%% get)\n", num_items, readratio);
+    ::mica::util::ZipfGen zg(range, zipf_theta, time(nullptr));
 
-    printf("generating workload\n");
+    for (size_t thread_id = 0; thread_id < num_threads; thread_id++)
+      op_count[thread_id] = 0;
+
+    for (size_t j = 0; j < num_operations; j++) {
+      size_t i;
+      i = zg.next();
+
+      uint16_t partition_id = key_parts[i];
+
+      uint32_t op_r = op_type_rand.next_u32();
+      bool is_get = false;
+
+      uint16_t thread_id;
+      if (concurrent_write == false)
+        thread_id = processor.get_owner_lcore_id(partition_id);
+      else
+        thread_id = static_cast<uint16_t>(thread_rand.next_u32() % num_threads);
+
+      if (op_count[thread_id] < max_num_operations_per_thread) {
+        uint8_t op_type;
+        op_type =
+            static_cast<uint8_t>(Operation::kSet);
+        op_types[thread_id][op_count[thread_id]] = op_type;
+        ::mica::util::memcpy(
+            op_keys[thread_id] + key_length * op_count[thread_id],
+            keys + key_length * i, key_length);
+        op_key_hashes[thread_id][op_count[thread_id]] = key_hashes[i];
+        ::mica::util::memcpy(
+            op_values[thread_id] + value_length * op_count[thread_id],
+            values + value_length * i, value_length);
+        op_count[thread_id]++;
+      } else
+        break;
+    }
+
+    fprintf(stderr, "populating\n");
+
+    for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
+      Task& task = tasks[thread_id];
+
+      task.count = op_count[thread_id];
+      task.total_operation_count = 0;
+      task.success_count = 0;
+    }
+
+    processor.reset_load_stats();
+
+    running_threads = 0;
+    ::mica::util::memory_barrier();
+
+    std::vector<std::thread> threads;
+    for (size_t thread_id = 1; thread_id < num_threads; thread_id++)
+      threads.emplace_back(benchmark_proc, &tasks[thread_id]);
+
+    benchmark_proc(&tasks[0]);
+
+    while (threads.size() > 0) {
+      threads.back().join();
+      threads.pop_back();
+    }
+
+  }
+
+  for (int testRepeat = 0; testRepeat < 10; testRepeat++) {
+    fprintf(stderr, "getting/setting %zu items (%d%% get)\n", num_items, readratio);
+
+    fprintf(stderr, "generating workload\n");
     ::mica::util::Rand thread_rand(1);
     // ::mica::util::Rand key_rand(2);
     ::mica::util::Rand op_type_rand(3);
@@ -376,7 +433,7 @@ void benchmark(double zipf_theta, int readratio) {
         break;
     }
 
-    printf("executing workload\n");
+    fprintf(stderr, "executing workload\n");
 
     for (size_t thread_id = 0; thread_id < num_threads; thread_id++) {
       Task& task = tasks[thread_id];
@@ -428,8 +485,8 @@ void benchmark(double zipf_theta, int readratio) {
         max_operation_count = tasks[thread_id].total_operation_count;
     }
 
-    printf("operations: %zu\n", total_operation_count);
-    printf("success_count: %zu\n", success_count);
+    fprintf(stderr, "operations: %zu\n", total_operation_count);
+    fprintf(stderr, "success_count: %zu\n", success_count);
 
     for (uint16_t thread_id = 0; thread_id < num_threads; thread_id++) {
       uint32_t request_count_sum = 0;
@@ -440,34 +497,41 @@ void benchmark(double zipf_theta, int readratio) {
       }
       if (request_count_sum == 0) request_count_sum = 1;
 
-      printf("lcore %2hu:", thread_id);
-      printf(" %4.0lf clocks/req ", static_cast<double>(processing_time) /
+      fprintf(stderr, "lcore %2hu:", thread_id);
+      fprintf(stderr, " %4.0lf clocks/req ", static_cast<double>(processing_time) /
                                         static_cast<double>(request_count_sum));
       for (uint16_t index = 0; index < processor.get_table_count(); index++) {
         uint32_t request_count = processor.get_request_count(thread_id, index);
-        printf(" %3.0lf", 100. * static_cast<double>(request_count) /
+        fprintf(stderr, " %3.0lf", 100. * static_cast<double>(request_count) /
                               static_cast<double>(max_operation_count));
       }
-      printf("\n");
+      fprintf(stderr, "\n");
     }
 
     auto get_set_ops = (double)total_operation_count / diff;
 
-    printf("\n");
+    fprintf(stderr, "\n");
 
     //printf("memory:     %10.2lf MB\n", (double)mem_diff * 0.000001);
-    printf("throughput:        %10.2lf Mops\n", get_set_ops * 0.000001);
-    printf("average latency:        %10.2lf us\n", diff * 1e6);
+    fprintf(stderr, "throughput:        %10.2lf Mops\n", get_set_ops * 0.000001);
+    fprintf(stderr, "average latency:        %10.2lf us\n", diff * 1e6);
+
+    if(testRepeat == 0){
+      fprintf(stdout, "TABLE: Performance\n");
+      fprintf(stdout, "Throughput (Mops)\tLatency (us)\n");
+    }
+    fprintf(stdout, "%lf\t%lf\n", get_set_ops * 0.000001, diff * 1e6);
+
   }
 }
 
 int main(int argc, const char* argv[]) {
-  if (argc < 2) {
-    printf("%s ZIPF-THETA\n", argv[0]);
+  if (argc < 3) {
+    printf("%s ZIPF-THETA READ-RATIO\n", argv[0]);
     return EXIT_FAILURE;
   }
 
-  benchmark(atof(argv[1]), 95);
+  benchmark(atof(argv[1]), atoi(argv[2]));
 
   return EXIT_SUCCESS;
 }

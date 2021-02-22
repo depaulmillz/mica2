@@ -524,7 +524,7 @@ void HugeTLBFS_SHM::initialize() {
     }
   }
 
-  printf("HugeTLBFS_SHM: syncing and sleeping for 1 second\n");
+  fprintf(stderr, "HugeTLBFS_SHM: syncing and sleeping for 1 second\n");
   sync();
   sleep(1);
 
