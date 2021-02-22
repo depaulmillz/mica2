@@ -201,8 +201,8 @@ void benchmark(double zipf_theta, int readratio) {
 
   fprintf(stderr, "zipf_theta = %lf\n", zipf_theta);
 
-  size_t num_items = 1000000;  //10000000;  //16 * 1048576;
-  size_t range = 1000000;
+  size_t num_items = 10000000;  //10000000;  //16 * 1048576;
+  size_t range = 10000000;
 
   auto config = ::mica::util::Config::load_file("microbench.json");
 
