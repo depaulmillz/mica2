@@ -954,7 +954,7 @@ void* HugeTLBFS_SHM::malloc_striped(size_t size) {
         // error
         break;
       }
-      if (++numa_node == ::mica::util::lcore.numa_count()) numa_node = 0;
+      if (++numa_node == 2) numa_node = 0;
       if (numa_node == 0) offset_in_stripe += kPageSize;
       p = (void*)((size_t)p + kPageSize);
     }
