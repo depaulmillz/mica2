@@ -208,7 +208,7 @@ void benchmark(double zipf_theta, int readratio) {
 
   uint16_t num_threads =
       static_cast<uint16_t>(config.get("processor").get("lcores").size());
-  size_t num_operations = 512;  //16 * 1048576;
+  size_t num_operations = num_threads * 512;  //16 * 1048576;
   size_t max_num_operations_per_thread = num_operations;
 
   size_t key_length = ::mica::util::roundup<8>(sizeof(uint64_t));
