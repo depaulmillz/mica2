@@ -196,7 +196,7 @@ void benchmark_proc(Task* task) {
   gettimeofday(&task->tv_end, nullptr);
 }
 
-void benchmark(double zipf_theta, int readratio) {
+void benchmark(double zipf_theta, int readratio, size_t valueSize) {
   ::mica::util::lcore.pin_thread(0);
 
   fprintf(stderr, "zipf_theta = %lf\n", zipf_theta);
@@ -212,7 +212,7 @@ void benchmark(double zipf_theta, int readratio) {
   size_t max_num_operations_per_thread = num_operations;
 
   size_t key_length = ::mica::util::roundup<8>(sizeof(uint64_t));
-  size_t value_length = ::mica::util::roundup<8>(sizeof(uint64_t));
+  size_t value_length = ::mica::util::roundup<8>(valueSize);
 
   PartitionsConfig::Alloc alloc(config.get("alloc"));
 
@@ -526,12 +526,12 @@ void benchmark(double zipf_theta, int readratio) {
 }
 
 int main(int argc, const char* argv[]) {
-  if (argc < 3) {
-    printf("%s ZIPF-THETA READ-RATIO\n", argv[0]);
+  if (argc < 4) {
+    printf("%s ZIPF-THETA READ-RATIO VALUE-SIZE\n", argv[0]);
     return EXIT_FAILURE;
   }
 
-  benchmark(atof(argv[1]), atoi(argv[2]));
+  benchmark(atof(argv[1]), atoi(argv[2]), (size_t)atoll(argv[3]));
 
   return EXIT_SUCCESS;
 }
